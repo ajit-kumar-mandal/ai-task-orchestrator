@@ -1,0 +1,26 @@
+name: Long-running AI task
+
+on:
+  repository_dispatch:
+    types: [run-ai-task]
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: Run AI task
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out task runner
+        uses: actions/checkout@v4
+      - name: Run task and report result
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_BASE_URL: ${{ vars.AI_API_BASE_URL }}
+          AI_DEFAULT_MODEL: ${{ vars.AI_DEFAULT_MODEL }}
+          CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+          CALLBACK_ALLOWED_HOSTS: ${{ vars.CALLBACK_ALLOWED_HOSTS }}
+          TASK_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: node .github/scripts/runner.mjs
