@@ -183,7 +183,7 @@ async function callAi(payload, apiKey, chatUrl) {
 
     if (!response.ok) {
       const message = await responseError(response, apiKey);
-      if (![429, 500, 502, 503, 504].includes(response.status) || attempt === MAX_ATTEMPTS - 1) {
+      if (!(response.status === 429 || response.status >= 500) || attempt === MAX_ATTEMPTS - 1) {
         throw new Error(message);
       }
       await new Promise((resolve) => setTimeout(resolve, retryAfterMs(response, attempt)));
