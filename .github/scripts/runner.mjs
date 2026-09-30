@@ -119,8 +119,10 @@ async function readEventStream(body) {
   let buffer = "";
   let text = "";
   let refusal = "";
+  let wasRefused = false;
   let usage = null;
   let streamError = null;
+  let streamErrorStatus;
 
   const consumeFrame = (frame) => {
     const data = frame.split(/\r?\n/)
@@ -137,6 +139,8 @@ async function readEventStream(body) {
     }
     if (event.error) {
       streamError = safeMessage(event.error.message || "The AI stream ended with an error.", process.env.AI_API_KEY);
+      const upstreamStatus = Number(event.error.upstream_http_status || event.error.http_status || event.error.status);
+      if (Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599) streamErrorStatus = upstreamStatus;
       return;
     }
     const choice = event.choices?.[0];
@@ -146,6 +150,7 @@ async function readEventStream(body) {
     }
     if (typeof choice?.delta?.refusal === "string") refusal += choice.delta.refusal;
     if (typeof choice?.message?.refusal === "string") refusal += choice.message.refusal;
+    if (choice?.finish_reason === "refusal") wasRefused = true;
     if (event.usage) usage = event.usage;
   };
 
@@ -158,8 +163,8 @@ async function readEventStream(body) {
     if (done) break;
   }
   if (buffer.trim()) consumeFrame(buffer);
-  if (streamError) fail(streamError);
-  return { text, refusal, usage };
+  if (streamError) throw Object.assign(new Error(streamError), { httpStatus: streamErrorStatus });
+  return { text, refusal, wasRefused, usage };
 }
 
 async function callAi(payload, apiKey, chatUrl) {
@@ -193,7 +198,9 @@ async function callAi(payload, apiKey, chatUrl) {
     }
 
     const result = await readEventStream(response.body);
-    if (result.refusal) return { model, status: "refused", result: result.refusal, usage: result.usage };
+    if (result.refusal || result.wasRefused) {
+      return { model, status: "refused", result: result.refusal || "The AI provider refused this request.", usage: result.usage };
+    }
     if (!result.text.trim()) fail("The AI API completed without returning a text answer.");
     return { model, status: "completed", result: result.text, usage: result.usage };
   }
