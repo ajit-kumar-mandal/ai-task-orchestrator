@@ -173,8 +173,9 @@ async function callAi(payload, apiKey, chatUrl) {
     try {
       response = await fetch(chatUrl, {
         method: "POST",
+        redirect: "error",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ model, messages: buildMessages(payload), stream: true }),
+        body: JSON.stringify({ model, messages: buildMessages(payload), stream: true, stream_options: { include_usage: true } }),
       });
     } catch (error) {
       // Network errors have no confirmed retryable HTTP status; do not replay the request.
@@ -202,6 +203,7 @@ async function postCallback(callback, payload, result, apiKey) {
   if (!callback) return;
   const response = await fetch(callback, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/json",
       "Idempotency-Key": payload.task_id,
