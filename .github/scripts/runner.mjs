@@ -100,7 +100,7 @@ async function responseError(response, apiKey) {
   } catch {
     // Keep the status-based message when the provider did not return JSON.
   }
-  return safeMessage(message, apiKey);
+  return { message: safeMessage(message, apiKey), status: response.status };
 }
 
 function buildMessages(payload) {
@@ -183,9 +183,10 @@ async function callAi(payload, apiKey, chatUrl) {
     }
 
     if (!response.ok) {
-      const message = await responseError(response, apiKey);
-      if (!(response.status === 429 || response.status >= 500) || attempt === MAX_ATTEMPTS - 1) {
-        throw new Error(message);
+      const upstream = await responseError(response, apiKey);
+      const accountOrConfigurationBlock = /account|billing|configuration|misconfigured|invalid api key|suspended|disabled/i.test(upstream.message);
+      if (!(response.status === 429 || (response.status >= 500 && !accountOrConfigurationBlock)) || attempt === MAX_ATTEMPTS - 1) {
+        throw Object.assign(new Error(upstream.message), { httpStatus: upstream.status });
       }
       await new Promise((resolve) => setTimeout(resolve, retryAfterMs(response, attempt)));
       continue;
@@ -230,7 +231,13 @@ async function main() {
   } catch (error) {
     const message = safeMessage(error?.message, apiKey);
     try {
-      await postCallback(callback, payload, { status: "failed", error: { message } }, apiKey);
+      await postCallback(callback, payload, {
+        status: "failed",
+        error: {
+          message,
+          ...(Number.isInteger(error?.httpStatus) ? { upstream_http_status: error.httpStatus } : {}),
+        },
+      }, apiKey);
     } catch (callbackError) {
       console.error(safeMessage(callbackError?.message, process.env.CALLBACK_TOKEN));
     }
