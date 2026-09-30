@@ -16,7 +16,7 @@ In **Settings → Secrets and variables → Actions**, add:
 | `AI_API_BASE_URL` | Variable | HTTPS provider base URL, usually ending in `/v1` (or the full `/chat/completions` URL) |
 | `AI_DEFAULT_MODEL` | Variable | Default model when a dispatch does not specify one |
 | `CALLBACK_TOKEN` | Secret, optional | Bearer token sent to your callback endpoint |
-| `CALLBACK_ALLOWED_HOSTS` | Variable, recommended | Comma-separated callback hostnames allowed by the runner |
+| `CALLBACK_ALLOWED_HOSTS` | Variable | Required: comma-separated callback hostnames allowed by the runner |
 
 Never put provider keys in the dispatch payload. The runner sends the prompt as a streamed Chat Completions request and assembles its text answer before the callback. Provider `429` and transient `5xx` responses receive at most three attempts with a delay; other HTTP errors end the task. No arbitrary request timeout is imposed by the runner.
 
@@ -43,7 +43,7 @@ Content-Type: application/json
 }
 ```
 
-`task_id`, `input`, and `callback_url` are required for a callback. `system` and `model` are optional. If omitted, the runner uses `AI_DEFAULT_MODEL`. The callback must be HTTPS; set `CALLBACK_ALLOWED_HOSTS` to restrict which hostnames can receive results.
+`task_id`, `input`, and `callback_url` are required for a callback. `system` and `model` are optional. If omitted, the runner uses `AI_DEFAULT_MODEL`. The callback must be HTTPS; configure `CALLBACK_ALLOWED_HOSTS` with the exact hostname(s) allowed to receive results. The runner refuses callback delivery until this allowlist is set.
 
 A `fetch` request from your server can dispatch it like this:
 
@@ -88,5 +88,5 @@ The callback must respond with a successful `2xx` status. A failed AI task repor
 
 - Use a dedicated GitHub token with the narrowest available access; never expose it in browser code.
 - Provider API keys and callback tokens are GitHub Actions secrets, not event data.
-- Set `CALLBACK_ALLOWED_HOSTS` to your app's hostname to prevent callbacks to unexpected hosts.
+- Set `CALLBACK_ALLOWED_HOSTS` to your app's hostname to prevent callbacks to unexpected hosts; it is required before callback delivery.
 - GitHub Actions jobs can run for up to 360 minutes; organization, repository, provider, and usage limits still apply.

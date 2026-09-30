@@ -71,7 +71,10 @@ function validateCallback(payload) {
   }
   const allowlist = (process.env.CALLBACK_ALLOWED_HOSTS || "")
     .split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
-  if (allowlist.length && !allowlist.includes(callback.hostname.toLowerCase())) {
+  if (allowlist.length === 0) {
+    fail("Configure CALLBACK_ALLOWED_HOSTS with the hostname allowed to receive results.");
+  }
+  if (!allowlist.includes(callback.hostname.toLowerCase())) {
     fail("callback_url host is not included in CALLBACK_ALLOWED_HOSTS.");
   }
   return callback;
