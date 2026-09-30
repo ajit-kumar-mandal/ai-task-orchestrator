@@ -100,7 +100,7 @@ async function responseError(response, apiKey) {
   } catch {
     // Keep the status-based message when the provider did not return JSON.
   }
-  return safeMessage(message, apiKey);
+  return { message: safeMessage(message, apiKey), status: response.status };
 }
 
 function buildMessages(payload) {
@@ -119,8 +119,10 @@ async function readEventStream(body) {
   let buffer = "";
   let text = "";
   let refusal = "";
+  let wasRefused = false;
   let usage = null;
   let streamError = null;
+  let streamErrorStatus;
 
   const consumeFrame = (frame) => {
     const data = frame.split(/\r?\n/)
@@ -137,6 +139,8 @@ async function readEventStream(body) {
     }
     if (event.error) {
       streamError = safeMessage(event.error.message || "The AI stream ended with an error.", process.env.AI_API_KEY);
+      const upstreamStatus = Number(event.error.upstream_http_status || event.error.http_status || event.error.status);
+      if (Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599) streamErrorStatus = upstreamStatus;
       return;
     }
     const choice = event.choices?.[0];
@@ -146,6 +150,7 @@ async function readEventStream(body) {
     }
     if (typeof choice?.delta?.refusal === "string") refusal += choice.delta.refusal;
     if (typeof choice?.message?.refusal === "string") refusal += choice.message.refusal;
+    if (choice?.finish_reason === "refusal") wasRefused = true;
     if (event.usage) usage = event.usage;
   };
 
@@ -158,8 +163,8 @@ async function readEventStream(body) {
     if (done) break;
   }
   if (buffer.trim()) consumeFrame(buffer);
-  if (streamError) fail(streamError);
-  return { text, refusal, usage };
+  if (streamError) throw Object.assign(new Error(streamError), { httpStatus: streamErrorStatus });
+  return { text, refusal, wasRefused, usage };
 }
 
 async function callAi(payload, apiKey, chatUrl) {
@@ -183,16 +188,19 @@ async function callAi(payload, apiKey, chatUrl) {
     }
 
     if (!response.ok) {
-      const message = await responseError(response, apiKey);
-      if (!(response.status === 429 || response.status >= 500) || attempt === MAX_ATTEMPTS - 1) {
-        throw new Error(message);
+      const upstream = await responseError(response, apiKey);
+      const accountOrConfigurationBlock = /account|billing|configuration|misconfigured|invalid api key|suspended|disabled/i.test(upstream.message);
+      if (!(response.status === 429 || (response.status >= 500 && !accountOrConfigurationBlock)) || attempt === MAX_ATTEMPTS - 1) {
+        throw Object.assign(new Error(upstream.message), { httpStatus: upstream.status });
       }
       await new Promise((resolve) => setTimeout(resolve, retryAfterMs(response, attempt)));
       continue;
     }
 
     const result = await readEventStream(response.body);
-    if (result.refusal) return { model, status: "refused", result: result.refusal, usage: result.usage };
+    if (result.refusal || result.wasRefused) {
+      return { model, status: "refused", result: result.refusal || "The AI provider refused this request.", usage: result.usage };
+    }
     if (!result.text.trim()) fail("The AI API completed without returning a text answer.");
     return { model, status: "completed", result: result.text, usage: result.usage };
   }
@@ -230,7 +238,13 @@ async function main() {
   } catch (error) {
     const message = safeMessage(error?.message, apiKey);
     try {
-      await postCallback(callback, payload, { status: "failed", error: { message } }, apiKey);
+      await postCallback(callback, payload, {
+        status: "failed",
+        error: {
+          message,
+          ...(Number.isInteger(error?.httpStatus) ? { upstream_http_status: error.httpStatus } : {}),
+        },
+      }, apiKey);
     } catch (callbackError) {
       console.error(safeMessage(callbackError?.message, process.env.CALLBACK_TOKEN));
     }
