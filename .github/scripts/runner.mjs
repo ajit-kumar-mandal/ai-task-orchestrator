@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
@@ -256,6 +256,20 @@ function scratchPath(root, path) {
   return resolved;
 }
 
+async function rejectScratchSymlinks(root, target) {
+  const relative = target.slice(root.length).split(sep).filter(Boolean);
+  let current = root;
+  for (const segment of relative) {
+    current = join(current, segment);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) fail("Symbolic links are not allowed in task scratch storage.");
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
 async function inspectScratch(root, limits, target = root) {
   let bytes = 0;
   let files = 0;
@@ -280,6 +294,7 @@ async function scratchTool(call, scratch) {
   try { input = JSON.parse(call.function.arguments || "{}"); } catch { fail(`Scratch tool call ${call.function.name} has invalid JSON arguments.`); }
   if (call.function.name === "scratch_list") {
     const path = scratchPath(scratch.root, input.path || ".");
+    await rejectScratchSymlinks(scratch.root, path);
     const info = await stat(path).catch(() => null);
     if (!info?.isDirectory()) fail("The requested scratch folder does not exist.");
     const entries = await readdir(path, { withFileTypes: true });
@@ -287,6 +302,7 @@ async function scratchTool(call, scratch) {
   }
   const path = scratchPath(scratch.root, input.path);
   if (call.function.name === "scratch_read") {
+    await rejectScratchSymlinks(scratch.root, path);
     const text = await readFile(path, "utf8");
     if (Buffer.byteLength(text) > MAX_TOOL_RESULT_BYTES) fail("The requested file is too large to return as a tool result.");
     return text;
@@ -294,16 +310,21 @@ async function scratchTool(call, scratch) {
   if (call.function.name === "scratch_write") {
     const content = typeof input.content === "string" ? input.content : typeof input.content_base64 === "string" ? Buffer.from(input.content_base64, "base64") : null;
     if (content === null) fail("scratch_write requires text content or content_base64.");
-    await mkdir(resolve(path, ".."), { recursive: true });
+    const parent = resolve(path, "..");
+    await rejectScratchSymlinks(scratch.root, parent);
+    await mkdir(parent, { recursive: true });
+    await rejectScratchSymlinks(scratch.root, path);
     await writeFile(path, content, { flag: "w" });
     const usage = await inspectScratch(scratch.root, scratch.limits);
     return JSON.stringify({ saved: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1), ...usage });
   }
   if (call.function.name === "scratch_mkdir") {
+    await rejectScratchSymlinks(scratch.root, path);
     await mkdir(path, { recursive: true });
     return JSON.stringify({ created: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1) });
   }
   if (call.function.name === "scratch_stat") {
+    await rejectScratchSymlinks(scratch.root, path);
     const info = await stat(path).catch(() => null);
     if (!info) return JSON.stringify({ exists: false });
     const usage = await inspectScratch(scratch.root, scratch.limits);
@@ -406,6 +427,7 @@ async function callBroker(call, broker, scratch) {
   for (const file of args.files || []) {
     if (!file || typeof file.path !== "string") fail("Each tool attachment must include a scratch-file path.");
     const path = scratchPath(scratch.root, file.path);
+    await rejectScratchSymlinks(scratch.root, path);
     const info = await stat(path).catch(() => null);
     if (!info?.isFile() || info.isSymbolicLink()) fail("A tool attachment must refer to a regular task scratch file.");
     const bytes = await readFile(path);

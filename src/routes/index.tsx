@@ -7,9 +7,9 @@ export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Longrun — GitHub AI task relay" },
-      { name: "description", content: "Run long OpenAI-compatible AI tasks through GitHub Actions and return results to your app." },
+      { name: "description", content: "Run long-running, multi-step AI and tool tasks through GitHub Actions, with temporary storage and an app-controlled tool broker." },
       { property: "og:title", content: "Longrun — GitHub AI task relay" },
-      { property: "og:description", content: "Run long AI tasks through GitHub Actions and return results to your app." },
+      { property: "og:description", content: "Run long-running AI workflows with authorized tools, isolated commands, and temporary files." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
     ],
@@ -23,7 +23,7 @@ function Index() {
     event_type: "run-ai-task",
     client_payload: {
       task_id: "task_01J...",
-      input: "Summarize the report and return a structured summary.",
+      input: "Read the report, use the available tools to create and upload the requested document, then report completion.",
       model: "gpt-4.1",
       callback_url: "https://your-app.example.com/api/ai-complete",
     },
@@ -53,7 +53,7 @@ function Index() {
           <div>
             <div className="mb-5 inline-flex items-center gap-2 border border-border bg-card px-3 py-1.5 text-xs font-medium text-primary"><Radio size={14} /> GITHUB ACTIONS · AI TASK RELAY</div>
             <h1 className="max-w-2xl text-4xl font-semibold leading-[1.06] tracking-tight sm:text-6xl">Let long tasks<br /><span className="text-primary">run their course.</span></h1>
-            <p className="mt-5 max-w-xl text-base leading-7 text-muted-foreground">Dispatch AI work from your app. Let GitHub Actions handle the long run, then send the result back to your callback.</p>
+            <p className="mt-5 max-w-xl text-base leading-7 text-muted-foreground">Run multi-step AI workflows, authorized app tools, and isolated document tasks—then return the result to your app.</p>
           </div>
           <div className="relay-grid flex min-h-48 flex-col justify-between border border-border bg-card p-5 sm:p-6">
             <div className="flex items-center justify-between text-xs text-muted-foreground"><span>RUN WINDOW</span><span className="flex items-center gap-1.5"><Clock3 size={14} /> UP TO 6 HOURS</span></div>
@@ -70,8 +70,8 @@ function Index() {
             <ol className="mt-8 space-y-0">
               {[
                 ["01", "Push to GitHub", "Include the workflow and task runner."],
-                ["02", "Add Actions secrets", "Store the API key and callback token securely."],
-                ["03", "Dispatch a task", "Send a task ID, prompt and callback URL."],
+                ["02", "Add Actions secrets", "Store AI, broker, and callback credentials securely."],
+                ["03", "Dispatch a task", "Send a task ID, prompt, tools, and temporary storage limits."],
               ].map(([number, title, description]) => <li key={number} className="flex gap-4 border-t border-border py-4"><span className="relay-code pt-0.5 text-xs text-primary">{number}</span><div><h3 className="text-sm font-semibold">{title}</h3><p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p></div></li>)}
             </ol>
           </div>
@@ -95,7 +95,7 @@ function Index() {
             <a href="https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions" target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-sm font-medium text-primary underline underline-offset-4">GitHub secrets guide <ArrowUpRight size={15} /></a>
           </div>
           <div className="grid gap-x-10 gap-y-5 sm:grid-cols-2 lg:grid-cols-4">
-            {[["AI_API_KEY", "Secret", "Your OpenAI-compatible provider key"], ["AI_API_BASE_URL", "Variable", "Provider URL ending in /v1"], ["AI_DEFAULT_MODEL", "Variable", "Default model when dispatch omits one"], ["CALLBACK_TOKEN", "Secret", "Optional bearer token for callbacks"]].map(([name, kind, description]) => <div key={name} className="border-t border-border pt-3"><div className="flex items-center justify-between gap-2"><code className="relay-code text-xs font-semibold">{name}</code><span className="text-[10px] uppercase text-muted-foreground">{kind}</span></div><p className="mt-2 text-xs leading-5 text-muted-foreground">{description}</p></div>)}
+            {[["AI_API_KEY", "Secret", "Chat-completions-compatible provider key"], ["TOOL_BROKER_TOKEN", "Secret", "Protects authorized tool access"], ["TASK_STORAGE_MAX_BYTES", "Variable", "Default temporary disk per task"], ["TASK_CONTAINER_IMAGES", "Variable", "Approved pinned software images"]].map(([name, kind, description]) => <div key={name} className="border-t border-border pt-3"><div className="flex items-center justify-between gap-2"><code className="relay-code text-xs font-semibold">{name}</code><span className="text-[10px] uppercase text-muted-foreground">{kind}</span></div><p className="mt-2 text-xs leading-5 text-muted-foreground">{description}</p></div>)}
           </div>
         </section>
 
