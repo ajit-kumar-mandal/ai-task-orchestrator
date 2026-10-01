@@ -1,8 +1,8 @@
 # Longrun — long-running AI and tool tasks
 
-Longrun dispatches streamed OpenAI-compatible AI work from your app into a GitHub Actions job (up to six hours). It supports bounded multi-step function/tool calling through a tool broker in your own app, task-scoped temporary files, and an HTTPS callback when work finishes.
+Longrun dispatches streamed AI work through a chat-completions-compatible API into a GitHub Actions job (up to six hours). It supports bounded multi-step tool calling through your app's broker, task-scoped temporary files, and optional isolated container commands for document conversion or approved software.
 
-The broker design keeps Composio and end-user OAuth in your app: GitHub Actions does not store a shared Composio API key or impersonate a user. Each task carries the authenticated user's stable app ID plus a short-lived, task-scoped credential that your app validates before executing any action.
+The broker design keeps Composio and end-user OAuth in your app: GitHub Actions does not store a Composio API key or impersonate a user. Your app encrypts its short-lived task grant for the runner; the runner decrypts it only in memory and sends it to your broker in a header. The broker still validates each task, user, tool permission, and expiry.
 
 ## 1. Add this project to GitHub
 
@@ -14,14 +14,15 @@ Open **Settings → Secrets and variables → Actions** in the GitHub repository
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `AI_API_KEY` | Secret | API key for the OpenAI-compatible model provider |
+| `AI_API_KEY` | Secret | API key for a chat-completions-compatible provider |
 | `AI_API_BASE_URL` | Variable | HTTPS API base URL, normally ending in `/v1` |
 | `AI_DEFAULT_MODEL` | Variable | Default model for tasks without an override |
 | `CALLBACK_TOKEN` | Secret, optional | Bearer token for your task-result callback |
 | `CALLBACK_ALLOWED_HOSTS` | Variable | Comma-separated exact HTTPS callback hostnames |
 | `TOOL_BROKER_URL` | Variable | Your app's HTTPS endpoint for executing authorized tools |
-| `TOOL_BROKER_TOKEN` | Secret, recommended | Optional app-wide broker credential in addition to per-task credentials |
+| `TOOL_BROKER_TOKEN` | Secret | High-entropy shared key for app-to-runner task-grant encryption and broker authentication |
 | `TOOL_BROKER_ALLOWED_HOSTS` | Variable | Exact HTTPS hostnames permitted for the app broker |
+| `TASK_CONTAINER_IMAGES` | Variable, optional | Approved task images pinned to exact SHA-256 digests |
 | `TASK_STORAGE_MAX_BYTES` | Variable, optional | Default task scratch limit in bytes; default `536870912` (512 MiB), cap `5368709120` (5 GiB) |
 | `TASK_STORAGE_MAX_FILES` | Variable, optional | Default scratch file-count limit; default `1000`, cap `10000` |
 
@@ -51,7 +52,7 @@ Content-Type: application/json
     },
     "tool_broker": {
       "app_user_id": "AUTHENTICATED_USER_STABLE_ID",
-      "auth_token": "SHORT_LIVED_TASK_SCOPED_TOKEN"
+      "authorization_grant_encrypted": "v1.IV_BASE64URL.TAG_BASE64URL.CIPHERTEXT_BASE64URL"
     },
     "tools": [
       {
@@ -102,7 +103,7 @@ Content-Type: application/json
 
 The model name stays exactly as supplied; `AI_DEFAULT_MODEL` is used when omitted. Tool schemas are passed to the selected OpenAI-compatible API. The runner retains the complete assistant tool-call message and each matching tool result in context, then asks the model to continue, up to 12 tool rounds and 60 total tool calls per task.
 
-The payload must be under 900,000 bytes. For larger prompts or documents, have the app store the content and let an authorized app tool fetch it, or split it into bounded chunks.
+The payload must be under 65,535 bytes (GitHub's repository-dispatch limit). For larger prompts or documents, have the app store the content and let an authorized app tool fetch it, or split it into bounded chunks.
 
 ## 4. App tool broker protocol
 
@@ -120,7 +121,7 @@ Implement `TOOL_BROKER_URL` in your app as a server-side endpoint. The runner se
 }
 ```
 
-The request includes `Authorization: Bearer <short-lived task token>`. The workflow may also add `Authorization: Bearer <TOOL_BROKER_TOKEN>` when `TOOL_BROKER_TOKEN` is configured; in that case the per-task credential is sent in `X-Longrun-Task-Token` instead. Your broker must validate the configured credential, task ID, user ID, granted tools, arguments, and expiry; resolve that user's already-authorized Composio connection; enforce its own confirmation rules for sensitive actions; and execute only the named, allowed tool. Never trust the user ID or granted tools just because they appeared in the task payload. Do not pass provider OAuth tokens, Composio keys, or user connection secrets back to the model or into Actions secrets.
+The request includes `Authorization: Bearer <TOOL_BROKER_TOKEN>` and `X-Longrun-Task-Token: <decrypted short-lived task grant>`. Encrypt the grant using AES-256-GCM. Derive a 32-byte key as HMAC-SHA256 keyed by `TOOL_BROKER_TOKEN` over the UTF-8 text `longrun-tool-grant-v1`; generate a fresh random 12-byte IV per grant; set AAD to UTF-8 `${task_id}:${app_user_id}`. Encode IV, authentication tag, and ciphertext as unpadded base64url in `v1.<iv>.<tag>.<ciphertext>`. Keep the shared token in GitHub Actions secrets and your app server's secure secret store only. Your broker must validate both credentials, task ID, user ID, granted tools, arguments, and expiry; resolve the user's already-authorized Composio connection; enforce confirmation rules for sensitive actions; and execute only the named, allowed tool. Reject reused, expired, wrong-task, or wrong-user grants. Never pass provider OAuth tokens, Composio keys, or user connection secrets back to the model or into Actions secrets.
 
 Successful response:
 
@@ -151,7 +152,11 @@ The model can use these built-in scratch tools:
 
 All paths are confined to that task's directory; symlink trees are rejected when enforcing storage limits. Use the broker to transfer files to email, Drive, or your app's durable storage. The runner deliberately does not keep or publish a GitHub Actions artifact by default.
 
-## 6. Callback contract
+## 6. Optional isolated software commands
+
+Command execution is disabled unless a task explicitly enables it. Add exact image references pinned to SHA-256 digests to `TASK_CONTAINER_IMAGES`; the workflow pulls only these pre-approved images before executing the task. A task names one approved image and allowlists exact executable names and arguments. Commands run without a shell, in a read-only container with no GitHub secrets, a writable mount limited to that task's temporary folder, CPU/memory/process/time/output caps, and network disabled by default. A task can explicitly opt into network access when downloads or package installation are needed; only enable it for reviewed jobs and trusted images. Never allow shell interpreters. GitHub runner environment and registry/network policies still apply.
+
+## 7. Callback contract
 
 Completed tasks send:
 
@@ -175,7 +180,7 @@ GitHub accepts a repository dispatch with HTTP `204`; the task runs asynchronous
 
 - Dispatch only from server-side code with a narrowly scoped repository token.
 - Never send AI, GitHub, Composio, or provider credentials in event payloads.
-- Pass an opaque, stable ID for the already authenticated app user and a short-lived task credential; authorize every tool again at the broker.
+- Pass an opaque, stable ID for the already authenticated app user and a task-bound encrypted grant; authorize every tool again at the broker.
 - Allowlist exact HTTPS callback and broker hostnames; redirects are rejected.
 - Publish only the tools a task is allowed to use; require user confirmation for sensitive or irreversible actions.
 - Treat email, PDF and tool output as untrusted input; validate schemas, size limits, and safe output behavior at the broker.
