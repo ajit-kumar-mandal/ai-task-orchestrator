@@ -23,9 +23,19 @@ function Index() {
     event_type: "run-ai-task",
     client_payload: {
       task_id: "task_01J...",
-      input: "Read the report, use the available tools to create and upload the requested document, then report completion.",
+      input: "Read today's email, find the discussion about the documents, create a summary, upload it to Drive, and email me when complete.",
       model: "gpt-4.1",
       callback_url: "https://your-app.example.com/api/ai-complete",
+      storage: { max_bytes: 1073741824, max_files: 2500 },
+      tool_broker: {
+        app_user_id: "AUTHENTICATED_USER_ID",
+        authorization_grant_encrypted: "v1.IV.TAG.CIPHERTEXT",
+      },
+      tools: [
+        { type: "function", function: { name: "search_email", description: "Search this user's authorized email.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false } } },
+        { type: "function", function: { name: "upload_drive_file", description: "Upload a task file to this user's authorized Drive.", parameters: { type: "object", properties: { filename: { type: "string" }, files: { type: "array", items: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } }, required: ["filename", "files"], additionalProperties: false } } },
+        { type: "function", function: { name: "send_email", description: "Email the user after the document is uploaded.", parameters: { type: "object", properties: { subject: { type: "string" }, body: { type: "string" } }, required: ["subject", "body"], additionalProperties: false } } },
+      ],
     },
   }, null, 2);
 
@@ -53,7 +63,7 @@ function Index() {
           <div>
             <div className="mb-5 inline-flex items-center gap-2 border border-border bg-card px-3 py-1.5 text-xs font-medium text-primary"><Radio size={14} /> GITHUB ACTIONS · AI TASK RELAY</div>
             <h1 className="max-w-2xl text-4xl font-semibold leading-[1.06] tracking-tight sm:text-6xl">Let long tasks<br /><span className="text-primary">run their course.</span></h1>
-            <p className="mt-5 max-w-xl text-base leading-7 text-muted-foreground">Run multi-step AI workflows, authorized app tools, and isolated document tasks—then return the result to your app.</p>
+            <p className="mt-5 max-w-xl text-base leading-7 text-muted-foreground">Run multi-step AI workflows that search email, create and upload documents, and send follow-up messages through your app's authorized tools.</p>
           </div>
           <div className="relay-grid flex min-h-48 flex-col justify-between border border-border bg-card p-5 sm:p-6">
             <div className="flex items-center justify-between text-xs text-muted-foreground"><span>RUN WINDOW</span><span className="flex items-center gap-1.5"><Clock3 size={14} /> UP TO 6 HOURS</span></div>
