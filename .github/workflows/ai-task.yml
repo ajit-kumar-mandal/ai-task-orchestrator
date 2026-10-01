@@ -22,5 +22,10 @@ jobs:
           AI_DEFAULT_MODEL: ${{ vars.AI_DEFAULT_MODEL }}
           CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
           CALLBACK_ALLOWED_HOSTS: ${{ vars.CALLBACK_ALLOWED_HOSTS }}
+          TOOL_BROKER_URL: ${{ vars.TOOL_BROKER_URL }}
+          TOOL_BROKER_TOKEN: ${{ secrets.TOOL_BROKER_TOKEN }}
+          TOOL_BROKER_ALLOWED_HOSTS: ${{ vars.TOOL_BROKER_ALLOWED_HOSTS }}
+          TASK_STORAGE_MAX_BYTES: ${{ vars.TASK_STORAGE_MAX_BYTES }}
+          TASK_STORAGE_MAX_FILES: ${{ vars.TASK_STORAGE_MAX_FILES }}
           TASK_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: node .github/scripts/runner.mjs

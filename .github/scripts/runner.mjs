@@ -1,7 +1,7 @@
-import { mkdtemp, mkdir, mkdtemp as makeTempDirectory, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 
 const MAX_ATTEMPTS = 3;
 const MAX_PROMPT_LENGTH = 200_000;
@@ -14,8 +14,7 @@ const MAX_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_STORAGE_FILES = 10_000;
 const DEFAULT_STORAGE_BYTES = 512 * 1024 * 1024;
 const DEFAULT_STORAGE_FILES = 1_000;
-const ALLOWED_TOOL_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
-const FORBIDDEN_HEADERS = /^(authorization|proxy-authorization|cookie|set-cookie|host|content-length|connection|transfer-encoding|x-api-key)$/i;
+const BLOCKED_COMMANDS = new Set(["sh", "bash", "zsh", "fish", "cmd", "powershell", "pwsh"]);
 
 const fail = (message) => { throw new Error(message); };
 
@@ -38,6 +37,7 @@ function parsePayload() {
   if (payload.tools !== undefined && !Array.isArray(payload.tools)) fail("tools must be a list of tool definitions.");
   if (payload.tool_broker !== undefined && (!payload.tool_broker || typeof payload.tool_broker !== "object" || Array.isArray(payload.tool_broker))) fail("tool_broker must contain an app broker URL and authorized-user context.");
   if (payload.storage !== undefined && (!payload.storage || typeof payload.storage !== "object" || Array.isArray(payload.storage))) fail("storage must contain temporary scratch-space limits.");
+  if (payload.execution !== undefined && (!payload.execution || typeof payload.execution !== "object" || Array.isArray(payload.execution))) fail("execution must contain an explicit command allowlist.");
   return payload;
 }
 
@@ -66,11 +66,12 @@ function validateCallback(payload) {
 function validateBroker(payload) {
   if (!payload.tools?.length) return null;
   const broker = payload.tool_broker;
-  if (!broker || typeof broker.url !== "string" || typeof broker.app_user_id !== "string" || !/^[\w-]{1,200}$/.test(broker.app_user_id)) {
-    fail("Tool calling requires tool_broker.url and the authenticated app user's stable app_user_id.");
+  const brokerUrl = typeof broker?.url === "string" ? broker.url : process.env.TOOL_BROKER_URL?.trim();
+  if (!broker || typeof brokerUrl !== "string" || typeof broker.app_user_id !== "string" || !/^[\w-]{1,200}$/.test(broker.app_user_id)) {
+    fail("Tool calling requires a configured app tool-broker URL and the authenticated app user's stable app_user_id.");
   }
   let url;
-  try { url = new URL(broker.url); } catch { fail("tool_broker.url must be a valid HTTPS URL."); }
+  try { url = new URL(brokerUrl); } catch { fail("The app tool-broker URL must be a valid HTTPS URL."); }
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) fail("tool_broker.url must be HTTPS without credentials, query parameters, or fragments.");
   const allowedHosts = (process.env.TOOL_BROKER_ALLOWED_HOSTS || "").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
   if (!allowedHosts.length || !allowedHosts.includes(url.hostname.toLowerCase())) fail("Add the app broker hostname to the TOOL_BROKER_ALLOWED_HOSTS repository variable.");
@@ -186,19 +187,41 @@ function scratchLimits(payload) {
   return { maxBytes: rawBytes, maxFiles: rawFiles };
 }
 
-async function createScratchSpace(payload) {
+function commandPolicy(payload) {
+  const execution = payload.execution;
+  if (!execution?.enabled) return null;
+  if (!Array.isArray(execution.allowed_commands) || execution.allowed_commands.length === 0 || execution.allowed_commands.length > 20) {
+    fail("Enable command execution only with a non-empty allowlist of up to 20 executable names.");
+  }
+  const allowed = new Set();
+  for (const name of execution.allowed_commands) {
+    if (typeof name !== "string" || !/^[a-zA-Z0-9._+-]{1,80}$/.test(name) || name.includes("/") || BLOCKED_COMMANDS.has(name.toLowerCase())) {
+      fail("Command allowlist entries must be executable names, not paths or shell interpreters.");
+    }
+    allowed.add(name);
+  }
+  const timeoutSeconds = Number(execution.timeout_seconds ?? 300);
+  const maxOutputBytes = Number(execution.max_output_bytes ?? 64_000);
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 900) fail("execution.timeout_seconds must be from 1 to 900.");
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1_000 || maxOutputBytes > MAX_TOOL_RESULT_BYTES) fail("execution.max_output_bytes must be from 1000 to 1000000.");
+  return { allowed, timeoutSeconds, maxOutputBytes };
+}
+
+async function createScratchSpace(payload, limits) {
   const basePath = process.env.TASK_STORAGE_BASE?.trim() || tmpdir();
   const base = resolve(basePath);
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(join(base, "longrun-task-"));
   const requested = payload.storage?.path;
+  let workingRoot = root;
   if (requested !== undefined && requested !== "") {
     if (typeof requested !== "string" || requested.includes("\0")) fail("storage.path must be a safe relative folder name.");
     const destination = resolve(root, requested);
     if (destination !== root && !destination.startsWith(`${root}${sep}`)) fail("storage.path must stay within the task's temporary workspace.");
     await mkdir(destination, { recursive: true });
+    workingRoot = destination;
   }
-  return { root, limits: scratchLimits(payload) };
+  return { root: workingRoot, cleanupRoot: root, limits };
 }
 
 function scratchPath(root, path) {
@@ -244,9 +267,10 @@ async function scratchTool(call, scratch) {
     return text;
   }
   if (call.function.name === "scratch_write") {
-    if (typeof input.content !== "string") fail("scratch_write requires text content.");
+    const content = typeof input.content === "string" ? input.content : typeof input.content_base64 === "string" ? Buffer.from(input.content_base64, "base64") : null;
+    if (content === null) fail("scratch_write requires text content or content_base64.");
     await mkdir(resolve(path, ".."), { recursive: true });
-    await writeFile(path, input.content, { flag: "w" });
+    await writeFile(path, content, { flag: "w" });
     const usage = await inspectScratch(scratch.root, scratch.limits);
     return JSON.stringify({ saved: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1), ...usage });
   }
@@ -263,26 +287,111 @@ async function scratchTool(call, scratch) {
   fail(`Unsupported scratch tool: ${call.function.name}.`);
 }
 
-function scratchTools() {
+async function runCommand(call, scratch, policy) {
+  if (!policy) fail("Command execution was not explicitly enabled for this task.");
+  let input;
+  try { input = JSON.parse(call.function.arguments || "{}"); } catch { fail("The command tool call has invalid JSON arguments."); }
+  if (typeof input.command !== "string" || !policy.allowed.has(input.command)) fail("The requested executable is not in this task's command allowlist.");
+  if (BLOCKED_COMMANDS.has(input.command.toLowerCase())) fail("Shell interpreters cannot be run by the task command tool.");
+  if (!Array.isArray(input.args) || input.args.length > 100 || input.args.some((arg) => typeof arg !== "string" || arg.length > 20_000)) fail("Command arguments must be a list of at most 100 strings.");
+  const cwd = scratchPath(scratch.root, input.cwd || ".");
+  const directory = await stat(cwd).catch(() => null);
+  if (!directory?.isDirectory()) fail("The requested command working directory does not exist.");
+  const timeoutSeconds = Math.min(policy.timeoutSeconds, Number.isSafeInteger(input.timeout_seconds) ? Math.max(1, input.timeout_seconds) : policy.timeoutSeconds);
+  const env = {
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    HOME: scratch.root,
+    TMPDIR: scratch.root,
+    TMP: scratch.root,
+    TEMP: scratch.root,
+    CI: "1",
+    PIP_CACHE_DIR: join(scratch.root, ".cache", "pip"),
+    NPM_CONFIG_CACHE: join(scratch.root, ".cache", "npm"),
+  };
+  await mkdir(env.PIP_CACHE_DIR, { recursive: true });
+  await mkdir(env.NPM_CONFIG_CACHE, { recursive: true });
+  const result = await new Promise((resolvePromise, reject) => {
+    let child;
+    try {
+      child = spawn(input.command, input.args, { cwd, env, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (error) {
+      reject(new Error(`Could not start the allowlisted command: ${error.message}`));
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let totalBytes = 0;
+    let timedOut = false;
+    let tooMuchOutput = false;
+    const append = (current, chunk) => {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > policy.maxOutputBytes) {
+        tooMuchOutput = true;
+        child.kill("SIGKILL");
+        return current;
+      }
+      return current + chunk.toString("utf8");
+    };
+    child.stdout.on("data", (chunk) => { stdout = append(stdout, chunk); });
+    child.stderr.on("data", (chunk) => { stderr = append(stderr, chunk); });
+    child.once("error", (error) => reject(new Error(`Could not start the allowlisted command: ${error.message}`)));
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutSeconds * 1000);
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      resolvePromise({ code, signal, timedOut, tooMuchOutput, stdout, stderr });
+    });
+  });
+  const safeOutput = safeMessage([result.stdout, result.stderr].filter(Boolean).join("\n").trim() || "(no output)", process.env.AI_API_KEY, process.env.TOOL_BROKER_TOKEN, process.env.CALLBACK_TOKEN);
+  const storage = await inspectScratch(scratch.root, scratch.limits);
+  if (result.timedOut) fail(`Command exceeded its ${timeoutSeconds}-second task limit. Partial output: ${safeOutput}`);
+  if (result.tooMuchOutput) fail(`Command exceeded its ${policy.maxOutputBytes}-byte output limit. Partial output: ${safeOutput}`);
+  if (result.code !== 0) fail(`Allowlisted command exited with code ${result.code ?? "unknown"}${result.signal ? ` (${result.signal})` : ""}. Output: ${safeOutput}`);
+  return JSON.stringify({ exit_code: result.code, output: safeOutput, storage });
+}
+
+function scratchTools(commandEnabled) {
   const define = (name, description, properties, required = []) => ({ type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } });
   const path = { type: "string", description: "Relative path inside this task's temporary workspace." };
-  return [
+  const tools = [
     define("scratch_list", "List names and types in a temporary folder.", { path }, []),
     define("scratch_read", "Read a UTF-8 text file from temporary task storage.", { path }, ["path"]),
-    define("scratch_write", "Create or replace a UTF-8 text file in temporary task storage.", { path, content: { type: "string" } }, ["path", "content"]),
+    define("scratch_write", "Create or replace a UTF-8 text file or base64 binary file in temporary task storage. Supply content or content_base64.", { path, content: { type: "string" }, content_base64: { type: "string" } }, ["path"]),
     define("scratch_mkdir", "Create a folder in temporary task storage.", { path }, ["path"]),
     define("scratch_stat", "Inspect a temporary file or folder and current storage use.", { path }, ["path"]),
   ];
+  if (commandEnabled) tools.push(define("run_command", "Run one explicitly allowlisted executable with arguments, without a shell, inside task scratch storage. Useful for approved document converters or package managers. No GitHub secrets are passed to the subprocess.", {
+    command: { type: "string", description: "An exact executable name from execution.allowed_commands." },
+    args: { type: "array", items: { type: "string" }, description: "Arguments passed directly to the executable; no shell expansion." },
+    cwd: { type: "string", description: "Optional directory relative to task scratch storage." },
+    timeout_seconds: { type: "integer", description: "Optional command timeout, capped by task policy." },
+  }, ["command", "args"]));
+  return tools;
 }
 
-async function callBroker(call, broker) {
+async function callBroker(call, broker, scratch) {
   let args;
   try { args = JSON.parse(call.function.arguments || "{}"); } catch { fail(`Tool ${call.function.name} returned invalid JSON arguments.`); }
+  const files = [];
+  if (args.files !== undefined && !Array.isArray(args.files)) fail("Tool file attachments must be supplied as a files array.");
+  for (const file of args.files || []) {
+    if (!file || typeof file.path !== "string") fail("Each tool attachment must include a scratch-file path.");
+    const path = scratchPath(scratch.root, file.path);
+    const info = await stat(path).catch(() => null);
+    if (!info?.isFile() || info.isSymbolicLink()) fail("A tool attachment must refer to a regular task scratch file.");
+    const bytes = await readFile(path);
+    if (bytes.byteLength > MAX_TOOL_RESULT_BYTES) fail("A single tool attachment exceeds the supported size limit.");
+    files.push({ path: file.path, name: typeof file.name === "string" ? file.name.slice(0, 180) : file.path.split(/[\\/]/).pop(), content_type: typeof file.content_type === "string" ? file.content_type.slice(0, 160) : "application/octet-stream", content_base64: bytes.toString("base64") });
+  }
   const response = await fetch(broker.url, {
     method: "POST",
     redirect: "error",
-    headers: { Authorization: `Bearer ${broker.authToken}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args }),
+    headers: {
+      Authorization: `Bearer ${process.env.TOOL_BROKER_TOKEN?.trim() || broker.authToken}`,
+      ...(process.env.TOOL_BROKER_TOKEN?.trim() ? { "X-Longrun-Task-Token": broker.authToken } : {}),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args, files }),
   });
   if (!response.ok) {
     const detail = safeMessage(await response.text(), broker.authToken, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN);
@@ -290,15 +399,25 @@ async function callBroker(call, broker) {
   }
   const result = await response.json();
   if (result?.ok === false) fail(safeMessage(result.error?.message || "The app tool broker rejected the tool request.", broker.authToken));
+  for (const file of result?.files || []) {
+    if (!file || typeof file.path !== "string" || typeof file.content_base64 !== "string") fail("The app tool broker returned an invalid file attachment.");
+    const path = scratchPath(scratch.root, file.path);
+    const bytes = Buffer.from(file.content_base64, "base64");
+    if (bytes.byteLength > MAX_TOOL_RESULT_BYTES) fail("A single broker file attachment exceeds the supported size limit.");
+    await mkdir(resolve(path, ".."), { recursive: true });
+    await writeFile(path, bytes, { flag: "w" });
+  }
+  if (result?.files?.length) await inspectScratch(scratch.root, scratch.limits);
   const serialized = JSON.stringify(result?.result ?? result);
   if (Buffer.byteLength(serialized) > MAX_TOOL_RESULT_BYTES) fail("The app tool broker result exceeds the supported tool-result limit.");
   return serialized;
 }
 
-async function runTool(call, broker, scratch) {
+async function runTool(call, broker, scratch, commands) {
   if (call.function.name.startsWith("scratch_")) return scratchTool(call, scratch);
+  if (call.function.name === "run_command") return runCommand(call, scratch, commands);
   if (!broker) fail(`Tool ${call.function.name} requires an authorized app tool broker.`);
-  return callBroker(call, broker);
+  return callBroker(call, broker, scratch);
 }
 
 async function requestAi(payload, apiKey, chatUrl, model, messages, tools) {
@@ -329,7 +448,8 @@ async function callAi(payload, apiKey, chatUrl, scratch, broker) {
   const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : process.env.AI_DEFAULT_MODEL?.trim();
   if (!model) fail("Provide a model in the dispatch payload or configure AI_DEFAULT_MODEL.");
   const customTools = configuredTools(payload);
-  const tools = [...scratchTools(), ...customTools];
+  const commands = commandPolicy(payload);
+  const tools = [...scratchTools(Boolean(commands)), ...customTools];
   const messages = buildMessages(payload, scratch);
   let usage = null;
   let toolCallsRun = 0;
@@ -348,7 +468,7 @@ async function callAi(payload, apiKey, chatUrl, scratch, broker) {
       toolCallsRun += 1;
       if (toolCallsRun > MAX_TOOL_CALLS) fail(`The task reached the maximum of ${MAX_TOOL_CALLS} tool calls.`);
       if (typeof toolCall.id !== "string" || !toolCall.id || typeof toolCall.function?.name !== "string") fail("The AI returned an incomplete tool call.");
-      const toolResult = await runTool(toolCall, broker, scratch);
+      const toolResult = await runTool(toolCall, broker, scratch, commands);
       messages.push({ role: "tool", tool_call_id: toolCall.id, content: toolResult });
       console.log(`Task ${payload.task_id}: completed tool ${toolCall.function.name} (${toolCallsRun}/${MAX_TOOL_CALLS}).`);
     }
@@ -374,8 +494,9 @@ async function main() {
   const apiKey = process.env.AI_API_KEY?.trim();
   if (!apiKey) fail("Configure the AI_API_KEY repository secret.");
   const { chatUrl } = getEndpoints();
-  const scratch = await createScratchSpace(payload);
   const broker = validateBroker(payload);
+  const limits = scratchLimits(payload);
+  const scratch = await createScratchSpace(payload, limits);
   if (broker) broker.taskId = payload.task_id;
   console.log(`Starting task ${payload.task_id}; scratch limit ${scratch.limits.maxBytes} bytes / ${scratch.limits.maxFiles} files.`);
   try {
@@ -392,7 +513,7 @@ async function main() {
     console.error(message);
     process.exitCode = 1;
   } finally {
-    await rm(scratch.root, { recursive: true, force: true });
+    await rm(scratch.cleanupRoot, { recursive: true, force: true });
   }
 }
 
