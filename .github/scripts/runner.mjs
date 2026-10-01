@@ -190,13 +190,15 @@ async function createScratchSpace(payload, limits) {
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(join(base, "longrun-task-"));
   const requested = payload.storage?.path;
+  let workingRoot = root;
   if (requested !== undefined && requested !== "") {
     if (typeof requested !== "string" || requested.includes("\0")) fail("storage.path must be a safe relative folder name.");
     const destination = resolve(root, requested);
     if (destination !== root && !destination.startsWith(`${root}${sep}`)) fail("storage.path must stay within the task's temporary workspace.");
     await mkdir(destination, { recursive: true });
+    workingRoot = destination;
   }
-  return { root, limits };
+  return { root: workingRoot, cleanupRoot: root, limits };
 }
 
 function scratchPath(root, path) {
@@ -268,7 +270,7 @@ function scratchTools() {
   return [
     define("scratch_list", "List names and types in a temporary folder.", { path }, []),
     define("scratch_read", "Read a UTF-8 text file from temporary task storage.", { path }, ["path"]),
-    define("scratch_write", "Create or replace a UTF-8 text file in temporary task storage.", { path, content: { type: "string" } }, ["path", "content"]),
+    define("scratch_write", "Create or replace a UTF-8 text file or base64 binary file in temporary task storage. Supply content or content_base64.", { path, content: { type: "string" }, content_base64: { type: "string" } }, ["path"]),
     define("scratch_mkdir", "Create a folder in temporary task storage.", { path }, ["path"]),
     define("scratch_stat", "Inspect a temporary file or folder and current storage use.", { path }, ["path"]),
   ];
@@ -291,7 +293,12 @@ async function callBroker(call, broker, scratch) {
   const response = await fetch(broker.url, {
     method: "POST",
     redirect: "error",
-    headers: { Authorization: `Bearer ${broker.authToken}`, "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      Authorization: `Bearer ${process.env.TOOL_BROKER_TOKEN?.trim() || broker.authToken}`,
+      ...(process.env.TOOL_BROKER_TOKEN?.trim() ? { "X-Longrun-Task-Token": broker.authToken } : {}),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
     body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args, files }),
   });
   if (!response.ok) {
@@ -412,7 +419,7 @@ async function main() {
     console.error(message);
     process.exitCode = 1;
   } finally {
-    await rm(scratch.root, { recursive: true, force: true });
+    await rm(scratch.cleanupRoot, { recursive: true, force: true });
   }
 }
 
