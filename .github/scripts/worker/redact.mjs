@@ -10,6 +10,8 @@ const PATTERNS = [
   [/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}/g, "[redacted-key]"],
   [/\bya29\.[A-Za-z0-9._-]{10,}/g, "[redacted-oauth]"],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, "[redacted-github]"],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted-github]"],
+  [/\bAIza[0-9A-Za-z_-]{30,}/g, "[redacted-key]"],
   [/((?:access|refresh|id)_token|client_secret|api[_-]?key|password|set-cookie|cookie|authorization)(["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, "$1$2[redacted]"],
 ];
 
