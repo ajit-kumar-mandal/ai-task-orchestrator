@@ -1,0 +1,402 @@
+import { mkdtemp, mkdir, mkdtemp as makeTempDirectory, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve, sep } from "node:path";
+import { randomUUID } from "node:crypto";
+
+const MAX_ATTEMPTS = 3;
+const MAX_PROMPT_LENGTH = 200_000;
+const MAX_RETRY_DELAY_MS = 30_000;
+const MAX_TOOL_ROUNDS = 12;
+const MAX_TOOL_CALLS = 60;
+const MAX_TOOL_RESULT_BYTES = 1_000_000;
+const MAX_DISPATCH_BYTES = 900_000;
+const MAX_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_STORAGE_FILES = 10_000;
+const DEFAULT_STORAGE_BYTES = 512 * 1024 * 1024;
+const DEFAULT_STORAGE_FILES = 1_000;
+const ALLOWED_TOOL_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+const FORBIDDEN_HEADERS = /^(authorization|proxy-authorization|cookie|set-cookie|host|content-length|connection|transfer-encoding|x-api-key)$/i;
+
+const fail = (message) => { throw new Error(message); };
+
+function safeMessage(message, ...secrets) {
+  let cleaned = String(message || "The task failed.");
+  for (const secret of secrets) if (secret) cleaned = cleaned.replaceAll(secret, "[redacted]");
+  return cleaned.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").slice(0, 1000) || "The task failed.";
+}
+
+function parsePayload() {
+  const raw = process.env.TASK_PAYLOAD || "{}";
+  if (Buffer.byteLength(raw) > MAX_DISPATCH_BYTES) fail("The dispatch payload exceeds the supported size limit.");
+  let payload;
+  try { payload = JSON.parse(raw); } catch { fail("The dispatch payload is not valid JSON."); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail("The dispatch payload must be a JSON object.");
+  if (typeof payload.task_id !== "string" || !/^[\w.:/-]{1,180}$/.test(payload.task_id)) fail("A task_id containing 1–180 letters, numbers, or . _ : / - is required.");
+  if (typeof payload.input !== "string" || !payload.input.trim()) fail("A non-empty input prompt is required.");
+  if (payload.input.length > MAX_PROMPT_LENGTH) fail(`The input prompt must be no longer than ${MAX_PROMPT_LENGTH} characters.`);
+  if (payload.callback_url && typeof payload.callback_url !== "string") fail("callback_url must be a string.");
+  if (payload.tools !== undefined && !Array.isArray(payload.tools)) fail("tools must be a list of tool definitions.");
+  if (payload.tool_broker !== undefined && (!payload.tool_broker || typeof payload.tool_broker !== "object" || Array.isArray(payload.tool_broker))) fail("tool_broker must contain an app broker URL and authorized-user context.");
+  if (payload.storage !== undefined && (!payload.storage || typeof payload.storage !== "object" || Array.isArray(payload.storage))) fail("storage must contain temporary scratch-space limits.");
+  return payload;
+}
+
+function getEndpoints() {
+  const raw = process.env.AI_API_BASE_URL?.trim();
+  if (!raw) fail("Configure the AI_API_BASE_URL repository variable.");
+  let base;
+  try { base = new URL(raw); } catch { fail("AI_API_BASE_URL must be a valid HTTPS URL ending in /v1."); }
+  if (base.protocol !== "https:" || base.username || base.password || base.search || base.hash) fail("AI_API_BASE_URL must be an HTTPS URL without embedded credentials or query parameters.");
+  const path = base.pathname.replace(/\/+$/, "");
+  const chatUrl = /\/chat\/completions$/.test(path) ? base.toString() : `${base.origin}${path}/chat/completions`;
+  return { chatUrl };
+}
+
+function validateCallback(payload) {
+  if (!payload.callback_url) return null;
+  let callback;
+  try { callback = new URL(payload.callback_url); } catch { fail("callback_url must be a valid HTTPS URL."); }
+  if (callback.protocol !== "https:" || callback.username || callback.password) fail("callback_url must use HTTPS and must not contain embedded credentials.");
+  const allowlist = (process.env.CALLBACK_ALLOWED_HOSTS || "").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
+  if (!allowlist.length) fail("Configure CALLBACK_ALLOWED_HOSTS with the hostname allowed to receive results.");
+  if (!allowlist.includes(callback.hostname.toLowerCase())) fail("callback_url host is not included in CALLBACK_ALLOWED_HOSTS.");
+  return callback;
+}
+
+function validateBroker(payload) {
+  if (!payload.tools?.length) return null;
+  const broker = payload.tool_broker;
+  if (!broker || typeof broker.url !== "string" || typeof broker.app_user_id !== "string" || !/^[\w-]{1,200}$/.test(broker.app_user_id)) {
+    fail("Tool calling requires tool_broker.url and the authenticated app user's stable app_user_id.");
+  }
+  let url;
+  try { url = new URL(broker.url); } catch { fail("tool_broker.url must be a valid HTTPS URL."); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) fail("tool_broker.url must be HTTPS without credentials, query parameters, or fragments.");
+  const allowedHosts = (process.env.TOOL_BROKER_ALLOWED_HOSTS || "").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
+  if (!allowedHosts.length || !allowedHosts.includes(url.hostname.toLowerCase())) fail("Add the app broker hostname to the TOOL_BROKER_ALLOWED_HOSTS repository variable.");
+  const authToken = typeof broker.auth_token === "string" ? broker.auth_token : "";
+  if (!authToken) fail("tool_broker.auth_token is required; pass a short-lived, task-scoped app credential.");
+  return { url, appUserId: broker.app_user_id, authToken };
+}
+
+function buildMessages(payload, scratch, context = []) {
+  const messages = [];
+  const customSystem = typeof payload.system === "string" ? payload.system.trim() : "";
+  const scratchInstructions = `Task-scoped temporary workspace: ${scratch.root}. Use the scratch tool to read/write files. This workspace is deleted after the task. Never assume files or secrets are retained between jobs.`;
+  messages.push({ role: "system", content: [customSystem, scratchInstructions].filter(Boolean).join("\n\n") });
+  messages.push({ role: "user", content: payload.input });
+  messages.push(...context);
+  return messages;
+}
+
+function retryAfterMs(response, attempt) {
+  const header = response.headers.get("retry-after");
+  if (header) {
+    const seconds = Number(header);
+    const dateMs = Date.parse(header) - Date.now();
+    const delay = Number.isFinite(seconds) ? seconds * 1000 : dateMs;
+    if (Number.isFinite(delay) && delay >= 0) return Math.min(delay, MAX_RETRY_DELAY_MS);
+  }
+  const exponential = Math.min(1000 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  return Math.round(exponential * (0.75 + Math.random() * 0.5));
+}
+
+async function responseError(response, apiKey) {
+  let message = `AI API returned HTTP ${response.status}.`;
+  try { const body = await response.json(); message = body?.error?.message || body?.message || message; } catch { /* keep status message */ }
+  return { message: safeMessage(message, apiKey), status: response.status };
+}
+
+async function readEventStream(body, apiKey) {
+  if (!body) fail("The AI API returned an empty response stream.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let refusal = "";
+  let wasRefused = false;
+  let usage = null;
+  let toolCalls = new Map();
+  let streamError = null;
+  let streamErrorStatus;
+
+  const consumeFrame = (frame) => {
+    const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+    if (!data || data === "[DONE]") return;
+    let event;
+    try { event = JSON.parse(data); } catch { streamError = "The AI API returned an invalid streaming response."; return; }
+    if (event.error) {
+      streamError = safeMessage(event.error.message || "The AI stream ended with an error.", apiKey);
+      const upstreamStatus = Number(event.error.upstream_http_status || event.error.http_status || event.error.status);
+      if (Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599) streamErrorStatus = upstreamStatus;
+      return;
+    }
+    const choice = event.choices?.[0];
+    const delta = choice?.delta;
+    if (typeof delta?.content === "string") text += delta.content;
+    if (Array.isArray(delta?.content)) for (const part of delta.content) if (typeof part?.text === "string") text += part.text;
+    if (typeof delta?.refusal === "string") refusal += delta.refusal;
+    if (typeof choice?.message?.refusal === "string") refusal += choice.message.refusal;
+    if (choice?.finish_reason === "refusal") wasRefused = true;
+    for (const part of delta?.tool_calls || []) {
+      const index = part.index ?? 0;
+      const existing = toolCalls.get(index) || { id: "", type: "function", function: { name: "", arguments: "" } };
+      if (part.id) existing.id = part.id;
+      if (part.type) existing.type = part.type;
+      if (part.function?.name) existing.function.name += part.function.name;
+      if (part.function?.arguments) existing.function.arguments += part.function.arguments;
+      toolCalls.set(index, existing);
+    }
+    if (choice?.message?.tool_calls?.length) {
+      toolCalls = new Map(choice.message.tool_calls.map((part, index) => [index, part]));
+    }
+    if (event.usage) usage = event.usage;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    for (const frame of frames) consumeFrame(frame);
+    if (done) break;
+  }
+  if (buffer.trim()) consumeFrame(buffer);
+  if (streamError) throw Object.assign(new Error(streamError), { httpStatus: streamErrorStatus });
+  return { text, refusal, wasRefused, usage, toolCalls: [...toolCalls.values()].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+}
+
+function configuredTools(payload) {
+  const custom = payload.tools || [];
+  if (custom.length > 100) fail("A task may define no more than 100 tools.");
+  const names = new Set();
+  for (const tool of custom) {
+    if (!tool || tool.type !== "function" || !tool.function || typeof tool.function.name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(tool.function.name)) fail("Each tool must use the OpenAI-compatible function tool format with a valid name.");
+    if (names.has(tool.function.name)) fail(`Duplicate tool name: ${tool.function.name}.`);
+    names.add(tool.function.name);
+  }
+  return custom;
+}
+
+function scratchLimits(payload) {
+  const rawBytes = Number(payload.storage?.max_bytes ?? process.env.TASK_STORAGE_MAX_BYTES ?? DEFAULT_STORAGE_BYTES);
+  const rawFiles = Number(payload.storage?.max_files ?? process.env.TASK_STORAGE_MAX_FILES ?? DEFAULT_STORAGE_FILES);
+  if (!Number.isSafeInteger(rawBytes) || rawBytes < 1 || rawBytes > MAX_STORAGE_BYTES) fail(`storage.max_bytes must be from 1 to ${MAX_STORAGE_BYTES} bytes.`);
+  if (!Number.isSafeInteger(rawFiles) || rawFiles < 1 || rawFiles > MAX_STORAGE_FILES) fail(`storage.max_files must be from 1 to ${MAX_STORAGE_FILES}.`);
+  return { maxBytes: rawBytes, maxFiles: rawFiles };
+}
+
+async function createScratchSpace(payload) {
+  const basePath = process.env.TASK_STORAGE_BASE?.trim() || tmpdir();
+  const base = resolve(basePath);
+  await mkdir(base, { recursive: true });
+  const root = await mkdtemp(join(base, "longrun-task-"));
+  const requested = payload.storage?.path;
+  if (requested !== undefined && requested !== "") {
+    if (typeof requested !== "string" || requested.includes("\0")) fail("storage.path must be a safe relative folder name.");
+    const destination = resolve(root, requested);
+    if (destination !== root && !destination.startsWith(`${root}${sep}`)) fail("storage.path must stay within the task's temporary workspace.");
+    await mkdir(destination, { recursive: true });
+  }
+  return { root, limits: scratchLimits(payload) };
+}
+
+function scratchPath(root, path) {
+  if (typeof path !== "string" || !path.trim() || path.includes("\0")) fail("A non-empty scratch-file path is required.");
+  const resolved = resolve(root, path);
+  if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) fail("Scratch file paths must stay inside the task workspace.");
+  return resolved;
+}
+
+async function inspectScratch(root, limits, target = root) {
+  let bytes = 0;
+  let files = 0;
+  const walk = async (directory) => {
+    for (const item of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, item.name);
+      if (item.isSymbolicLink()) fail("Symbolic links are not allowed in task scratch storage.");
+      if (item.isDirectory()) await walk(path);
+      else if (item.isFile()) {
+        files += 1;
+        bytes += (await stat(path)).size;
+        if (files > limits.maxFiles || bytes > limits.maxBytes) fail("Task scratch storage limit exceeded; raise this task's storage.max_bytes or storage.max_files within the repository cap.");
+      }
+    }
+  };
+  await walk(target);
+  return { bytes, files };
+}
+
+async function scratchTool(call, scratch) {
+  let input;
+  try { input = JSON.parse(call.function.arguments || "{}"); } catch { fail(`Scratch tool call ${call.function.name} has invalid JSON arguments.`); }
+  if (call.function.name === "scratch_list") {
+    const path = scratchPath(scratch.root, input.path || ".");
+    const info = await stat(path).catch(() => null);
+    if (!info?.isDirectory()) fail("The requested scratch folder does not exist.");
+    const entries = await readdir(path, { withFileTypes: true });
+    return JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other" })));
+  }
+  const path = scratchPath(scratch.root, input.path);
+  if (call.function.name === "scratch_read") {
+    const text = await readFile(path, "utf8");
+    if (Buffer.byteLength(text) > MAX_TOOL_RESULT_BYTES) fail("The requested file is too large to return as a tool result.");
+    return text;
+  }
+  if (call.function.name === "scratch_write") {
+    if (typeof input.content !== "string") fail("scratch_write requires text content.");
+    await mkdir(resolve(path, ".."), { recursive: true });
+    await writeFile(path, input.content, { flag: "w" });
+    const usage = await inspectScratch(scratch.root, scratch.limits);
+    return JSON.stringify({ saved: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1), ...usage });
+  }
+  if (call.function.name === "scratch_mkdir") {
+    await mkdir(path, { recursive: true });
+    return JSON.stringify({ created: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1) });
+  }
+  if (call.function.name === "scratch_stat") {
+    const info = await stat(path).catch(() => null);
+    if (!info) return JSON.stringify({ exists: false });
+    const usage = await inspectScratch(scratch.root, scratch.limits);
+    return JSON.stringify({ exists: true, type: info.isDirectory() ? "directory" : "file", size: info.size, ...usage });
+  }
+  fail(`Unsupported scratch tool: ${call.function.name}.`);
+}
+
+function scratchTools() {
+  const define = (name, description, properties, required = []) => ({ type: "function", function: { name, description, parameters: { type: "object", properties, required, additionalProperties: false } } });
+  const path = { type: "string", description: "Relative path inside this task's temporary workspace." };
+  return [
+    define("scratch_list", "List names and types in a temporary folder.", { path }, []),
+    define("scratch_read", "Read a UTF-8 text file from temporary task storage.", { path }, ["path"]),
+    define("scratch_write", "Create or replace a UTF-8 text file in temporary task storage.", { path, content: { type: "string" } }, ["path", "content"]),
+    define("scratch_mkdir", "Create a folder in temporary task storage.", { path }, ["path"]),
+    define("scratch_stat", "Inspect a temporary file or folder and current storage use.", { path }, ["path"]),
+  ];
+}
+
+async function callBroker(call, broker) {
+  let args;
+  try { args = JSON.parse(call.function.arguments || "{}"); } catch { fail(`Tool ${call.function.name} returned invalid JSON arguments.`); }
+  const response = await fetch(broker.url, {
+    method: "POST",
+    redirect: "error",
+    headers: { Authorization: `Bearer ${broker.authToken}`, "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args }),
+  });
+  if (!response.ok) {
+    const detail = safeMessage(await response.text(), broker.authToken, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN);
+    throw Object.assign(new Error(`App tool broker returned HTTP ${response.status}: ${detail}`), { httpStatus: response.status });
+  }
+  const result = await response.json();
+  if (result?.ok === false) fail(safeMessage(result.error?.message || "The app tool broker rejected the tool request.", broker.authToken));
+  const serialized = JSON.stringify(result?.result ?? result);
+  if (Buffer.byteLength(serialized) > MAX_TOOL_RESULT_BYTES) fail("The app tool broker result exceeds the supported tool-result limit.");
+  return serialized;
+}
+
+async function runTool(call, broker, scratch) {
+  if (call.function.name.startsWith("scratch_")) return scratchTool(call, scratch);
+  if (!broker) fail(`Tool ${call.function.name} requires an authorized app tool broker.`);
+  return callBroker(call, broker);
+}
+
+async function requestAi(payload, apiKey, chatUrl, model, messages, tools) {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(chatUrl, {
+        method: "POST", redirect: "error",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true }, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }),
+      });
+    } catch (error) {
+      throw new Error(safeMessage(error?.message || "Could not reach the AI API.", apiKey));
+    }
+    if (!response.ok) {
+      const upstream = await responseError(response, apiKey);
+      const blocked = /account|billing|configuration|misconfigured|invalid api key|suspended|disabled/i.test(upstream.message);
+      if (!(response.status === 429 || (response.status >= 500 && !blocked)) || attempt === MAX_ATTEMPTS - 1) throw Object.assign(new Error(upstream.message), { httpStatus: upstream.status });
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, retryAfterMs(response, attempt)));
+      continue;
+    }
+    return readEventStream(response.body, apiKey);
+  }
+  fail("The AI request could not be completed.");
+}
+
+async function callAi(payload, apiKey, chatUrl, scratch, broker) {
+  const model = typeof payload.model === "string" && payload.model.trim() ? payload.model.trim() : process.env.AI_DEFAULT_MODEL?.trim();
+  if (!model) fail("Provide a model in the dispatch payload or configure AI_DEFAULT_MODEL.");
+  const customTools = configuredTools(payload);
+  const tools = [...scratchTools(), ...customTools];
+  const messages = buildMessages(payload, scratch);
+  let usage = null;
+  let toolCallsRun = 0;
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
+    const result = await requestAi(payload, apiKey, chatUrl, model, messages, tools);
+    if (result.usage) usage = result.usage;
+    if (result.refusal || result.wasRefused) return { model, status: "refused", result: result.refusal || "The AI provider refused this request.", usage };
+    if (!result.toolCalls.length) {
+      if (!result.text.trim()) fail("The AI API completed without returning a text answer or tool call.");
+      return { model, status: "completed", result: result.text, usage, tool_calls: toolCallsRun };
+    }
+    if (round === MAX_TOOL_ROUNDS) fail(`The task reached the maximum of ${MAX_TOOL_ROUNDS} tool rounds.`);
+    messages.push({ role: "assistant", content: result.text || null, tool_calls: result.toolCalls });
+    for (const toolCall of result.toolCalls) {
+      toolCallsRun += 1;
+      if (toolCallsRun > MAX_TOOL_CALLS) fail(`The task reached the maximum of ${MAX_TOOL_CALLS} tool calls.`);
+      if (typeof toolCall.id !== "string" || !toolCall.id || typeof toolCall.function?.name !== "string") fail("The AI returned an incomplete tool call.");
+      const toolResult = await runTool(toolCall, broker, scratch);
+      messages.push({ role: "tool", tool_call_id: toolCall.id, content: toolResult });
+      console.log(`Task ${payload.task_id}: completed tool ${toolCall.function.name} (${toolCallsRun}/${MAX_TOOL_CALLS}).`);
+    }
+  }
+  fail("The task exceeded the tool-round limit.");
+}
+
+async function postCallback(callback, payload, result, secrets) {
+  if (!callback) return;
+  const response = await fetch(callback, {
+    method: "POST", redirect: "error",
+    headers: { "Content-Type": "application/json", "Idempotency-Key": payload.task_id, ...(process.env.CALLBACK_TOKEN ? { Authorization: `Bearer ${process.env.CALLBACK_TOKEN}` } : {}) },
+    body: JSON.stringify({ task_id: payload.task_id, ...result }),
+  });
+  if (!response.ok) throw new Error(`Callback returned HTTP ${response.status}.`);
+  console.log(`Callback accepted task ${payload.task_id}.`);
+  void secrets;
+}
+
+async function main() {
+  const payload = parsePayload();
+  const callback = validateCallback(payload);
+  const apiKey = process.env.AI_API_KEY?.trim();
+  if (!apiKey) fail("Configure the AI_API_KEY repository secret.");
+  const { chatUrl } = getEndpoints();
+  const scratch = await createScratchSpace(payload);
+  const broker = validateBroker(payload);
+  if (broker) broker.taskId = payload.task_id;
+  console.log(`Starting task ${payload.task_id}; scratch limit ${scratch.limits.maxBytes} bytes / ${scratch.limits.maxFiles} files.`);
+  try {
+    const result = await callAi(payload, apiKey, chatUrl, scratch, broker);
+    await postCallback(callback, payload, { ...result, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authToken]);
+    console.log(`Task ${payload.task_id} finished with status ${result.status}.`);
+  } catch (error) {
+    const message = safeMessage(error?.message, apiKey, broker?.authToken, process.env.CALLBACK_TOKEN);
+    try {
+      await postCallback(callback, payload, { status: "failed", error: { message, ...(Number.isInteger(error?.httpStatus) ? { upstream_http_status: error.httpStatus } : {}) }, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authToken]);
+    } catch (callbackError) {
+      console.error(safeMessage(callbackError?.message, broker?.authToken, process.env.CALLBACK_TOKEN, apiKey));
+    }
+    console.error(message);
+    process.exitCode = 1;
+  } finally {
+    await rm(scratch.root, { recursive: true, force: true });
+  }
+}
+
+main().catch((error) => {
+  console.error(safeMessage(error?.message, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN));
+  process.exitCode = 1;
+});
