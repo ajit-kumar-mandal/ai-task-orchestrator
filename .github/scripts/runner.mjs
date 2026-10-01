@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
-import { createDecipheriv, createHash } from "node:crypto";
+import { createDecipheriv, createHmac } from "node:crypto";
 
 const MAX_ATTEMPTS = 3;
 const MAX_PROMPT_LENGTH = 200_000;
@@ -86,7 +86,7 @@ function decryptAuthorizationGrant(broker, taskId) {
   const parts = broker.encryptedGrant.split(".");
   if (parts.length !== 4 || parts[0] !== "v1") fail("The encrypted app authorization grant has an unsupported format.");
   try {
-    const key = createHash("sha256").update(broker.sharedToken, "utf8").digest();
+    const key = createHmac("sha256", broker.sharedToken).update("longrun-tool-grant-v1", "utf8").digest();
     const iv = Buffer.from(parts[1], "base64url");
     const tag = Buffer.from(parts[2], "base64url");
     const ciphertext = Buffer.from(parts[3], "base64url");
@@ -193,6 +193,7 @@ function configuredTools(payload) {
   const names = new Set();
   for (const tool of custom) {
     if (!tool || tool.type !== "function" || !tool.function || typeof tool.function.name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(tool.function.name)) fail("Each tool must use the OpenAI-compatible function tool format with a valid name.");
+    if (["scratch_list", "scratch_read", "scratch_write", "scratch_mkdir", "scratch_stat", "run_command"].includes(tool.function.name)) fail(`Tool name ${tool.function.name} is reserved by the task runner.`);
     if (names.has(tool.function.name)) fail(`Duplicate tool name: ${tool.function.name}.`);
     names.add(tool.function.name);
   }
@@ -323,15 +324,17 @@ async function runCommand(call, scratch, policy) {
   if (!directory?.isDirectory()) fail("The requested command working directory does not exist.");
   const timeoutSeconds = Math.min(policy.timeoutSeconds, Number.isSafeInteger(input.timeout_seconds) ? Math.max(1, input.timeout_seconds) : policy.timeoutSeconds);
   const containerWorkingDirectory = resolve("/workspace", input.cwd || ".");
-  if (!containerWorkingDirectory.startsWith("/workspace/")) fail("The command working directory must stay inside task scratch storage.");
+  if (containerWorkingDirectory !== "/workspace" && !containerWorkingDirectory.startsWith("/workspace/")) fail("The command working directory must stay inside task scratch storage.");
+  const containerUid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const containerGid = typeof process.getgid === "function" ? process.getgid() : 1000;
   const containerArgs = [
     "run", "--rm", "--pull=never",
     "--network", policy.networkAccess ? "bridge" : "none",
-    "--pids-limit=128", "--memory=1g", "--cpus=2",
+    "--pids-limit=128", "--memory=1g", "--cpus=2", "--read-only",
     "--cap-drop=ALL", "--security-opt=no-new-privileges",
-    "--user", `${typeof process.getuid === "function" ? process.getuid() : 1000}:${typeof process.getgid === "function" ? process.getgid() : 1000}`,
-    "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
-    "--mount", `type=bind,src=${scratch.root},dst=/workspace,rw",
+    "--user", `${containerUid}:${containerGid}`,
+    "--tmpfs", `/tmp:rw,nosuid,nodev,size=256m,uid=${containerUid},gid=${containerGid}`,
+    "--mount", `type=bind,src=${scratch.root},dst=/workspace,rw`,
     "--workdir", containerWorkingDirectory,
     "--env", "HOME=/tmp", "--env", "TMPDIR=/tmp", "--env", "CI=1",
     policy.image, input.command, ...input.args,
@@ -413,19 +416,19 @@ async function callBroker(call, broker, scratch) {
     method: "POST",
     redirect: "error",
     headers: {
-      Authorization: `Bearer ${process.env.TOOL_BROKER_TOKEN?.trim() || broker.authToken}`,
-      ...(process.env.TOOL_BROKER_TOKEN?.trim() ? { "X-Longrun-Task-Token": broker.authToken } : {}),
+      Authorization: `Bearer ${broker.sharedToken}`,
+      "X-Longrun-Task-Token": broker.authorizationGrant,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
     body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args, files }),
   });
   if (!response.ok) {
-    const detail = safeMessage(await response.text(), broker.authToken, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN);
+    const detail = safeMessage(await response.text(), broker.authorizationGrant, broker.sharedToken, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN);
     throw Object.assign(new Error(`App tool broker returned HTTP ${response.status}: ${detail}`), { httpStatus: response.status });
   }
   const result = await response.json();
-  if (result?.ok === false) fail(safeMessage(result.error?.message || "The app tool broker rejected the tool request.", broker.authToken));
+  if (result?.ok === false) fail(safeMessage(result.error?.message || "The app tool broker rejected the tool request.", broker.authorizationGrant, broker.sharedToken));
   for (const file of result?.files || []) {
     if (!file || typeof file.path !== "string" || typeof file.content_base64 !== "string") fail("The app tool broker returned an invalid file attachment.");
     const path = scratchPath(scratch.root, file.path);
@@ -523,22 +526,22 @@ async function main() {
   const { chatUrl } = getEndpoints();
   const broker = validateBroker(payload);
   const limits = scratchLimits(payload);
-  const scratch = await createScratchSpace(payload, limits);
   if (broker) {
     broker.taskId = payload.task_id;
     broker.authorizationGrant = decryptAuthorizationGrant(broker, payload.task_id);
   }
+  const scratch = await createScratchSpace(payload, limits);
   console.log(`Starting task ${payload.task_id}; scratch limit ${scratch.limits.maxBytes} bytes / ${scratch.limits.maxFiles} files.`);
   try {
     const result = await callAi(payload, apiKey, chatUrl, scratch, broker);
-    await postCallback(callback, payload, { ...result, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authToken]);
+    await postCallback(callback, payload, { ...result, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authorizationGrant, broker?.sharedToken]);
     console.log(`Task ${payload.task_id} finished with status ${result.status}.`);
   } catch (error) {
-    const message = safeMessage(error?.message, apiKey, broker?.authToken, process.env.CALLBACK_TOKEN);
+    const message = safeMessage(error?.message, apiKey, broker?.authorizationGrant, broker?.sharedToken, process.env.CALLBACK_TOKEN);
     try {
-      await postCallback(callback, payload, { status: "failed", error: { message, ...(Number.isInteger(error?.httpStatus) ? { upstream_http_status: error.httpStatus } : {}) }, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authToken]);
+      await postCallback(callback, payload, { status: "failed", error: { message, ...(Number.isInteger(error?.httpStatus) ? { upstream_http_status: error.httpStatus } : {}) }, storage: { persistence: "temporary", retained: false } }, [apiKey, broker?.authorizationGrant, broker?.sharedToken]);
     } catch (callbackError) {
-      console.error(safeMessage(callbackError?.message, broker?.authToken, process.env.CALLBACK_TOKEN, apiKey));
+      console.error(safeMessage(callbackError?.message, broker?.authorizationGrant, broker?.sharedToken, process.env.CALLBACK_TOKEN, apiKey));
     }
     console.error(message);
     process.exitCode = 1;
@@ -548,6 +551,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(safeMessage(error?.message, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN));
+  console.error(safeMessage(error?.message, process.env.AI_API_KEY, process.env.TOOL_BROKER_TOKEN, process.env.CALLBACK_TOKEN));
   process.exitCode = 1;
 });
