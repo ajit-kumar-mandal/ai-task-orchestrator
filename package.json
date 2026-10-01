@@ -9,7 +9,8 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "test:worker": "node --test --test-timeout=20000 .github/scripts/tests/*.test.mjs"
   },
   "overrides": {
     "rolldown": "1.2.1"
