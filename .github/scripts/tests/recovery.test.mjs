@@ -43,7 +43,7 @@ test("worker crash: periodic checkpoints let a new hop resume", async () => {
   // Hop 1 "crashes" (model never responds and the process is abandoned).
   void harness({
     payload: v2(),
-    env: { CHECKPOINT_INTERVAL_MS: "0" },
+    env: { CHECKPOINT_INTERVAL_MS: "0", MODEL_CALL_TIMEOUT_MS: "300" },
     checkpointStore: store,
     ai: (_b, n, init) => (n <= 2 ? toolReply([writeCall(`x${n}`)]) : hang(init.signal)),
   });

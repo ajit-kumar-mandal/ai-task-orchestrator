@@ -113,7 +113,7 @@ export async function runExecution(options = {}) {
     } catch (error) {
       if (error.category === FailureCategory.LEASE_FENCING_FAILURE) throw error;
       log.emit("execution_failed", { stop_reason: "checkpoint_failed", failure_category: FailureCategory.CHECKPOINT_FAILURE, message: error.message, intended_stop_reason: stopReason });
-      return { status: ExecutionState.HANDOFF_PENDING, stopReason: "checkpoint_failed", category: FailureCategory.CHECKPOINT_FAILURE, intendedStopReason: stopReason, nextHopAt: iso(now()), ...extra };
+      return { ...extra, status: ExecutionState.HANDOFF_PENDING, stopReason: "checkpoint_failed", category: FailureCategory.CHECKPOINT_FAILURE, intendedStopReason: stopReason, nextHopAt: iso(now()) };
     }
     if (status === ExecutionState.HANDOFF_PENDING) {
       const nextHopAt = extra.nextHopAt ?? iso(now());

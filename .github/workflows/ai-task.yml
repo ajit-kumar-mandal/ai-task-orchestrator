@@ -7,27 +7,46 @@ on:
 permissions:
   contents: read
 
+# Defence in depth: one execution per task at a time. Study AI's lease is the
+# authoritative fence; this only prevents GitHub from running two hops at once.
+concurrency:
+  group: longrun-${{ github.event.client_payload.task_id }}
+  cancel-in-progress: false
+
 jobs:
   run:
-    name: Run AI task
+    name: Run AI task execution
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Check out task runner
+      - name: Check out execution worker
         uses: actions/checkout@v4
-      - name: Run task and report result
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run execution and report lifecycle
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_API_BASE_URL: ${{ vars.AI_API_BASE_URL }}
           AI_DEFAULT_MODEL: ${{ vars.AI_DEFAULT_MODEL }}
           CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
           CALLBACK_ALLOWED_HOSTS: ${{ vars.CALLBACK_ALLOWED_HOSTS }}
+          STUDYAI_CHECKPOINT_URL: ${{ vars.STUDYAI_CHECKPOINT_URL }}
+          CHECKPOINT_ALLOWED_HOSTS: ${{ vars.CHECKPOINT_ALLOWED_HOSTS }}
           TOOL_BROKER_URL: ${{ vars.TOOL_BROKER_URL }}
           TOOL_BROKER_TOKEN: ${{ secrets.TOOL_BROKER_TOKEN }}
           TOOL_BROKER_ALLOWED_HOSTS: ${{ vars.TOOL_BROKER_ALLOWED_HOSTS }}
           TASK_CONTAINER_IMAGES: ${{ vars.TASK_CONTAINER_IMAGES }}
           TASK_STORAGE_MAX_BYTES: ${{ vars.TASK_STORAGE_MAX_BYTES }}
           TASK_STORAGE_MAX_FILES: ${{ vars.TASK_STORAGE_MAX_FILES }}
+          EXECUTION_DEADLINE_MS: ${{ vars.EXECUTION_DEADLINE_MS }}
+          CHECKPOINT_RESERVE_MS: ${{ vars.CHECKPOINT_RESERVE_MS }}
+          MODEL_CALL_TIMEOUT_MS: ${{ vars.MODEL_CALL_TIMEOUT_MS }}
+          TOOL_CALL_TIMEOUT_MS: ${{ vars.TOOL_CALL_TIMEOUT_MS }}
+          CALLBACK_TIMEOUT_MS: ${{ vars.CALLBACK_TIMEOUT_MS }}
+          HEARTBEAT_INTERVAL_MS: ${{ vars.HEARTBEAT_INTERVAL_MS }}
+          CHECKPOINT_INTERVAL_MS: ${{ vars.CHECKPOINT_INTERVAL_MS }}
           TASK_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           node .github/scripts/prepare-images.mjs

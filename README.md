@@ -1,4 +1,18 @@
-# Longrun — long-running AI and tool tasks
+# Longrun — GitHub Actions execution worker for Study AI
+
+Longrun is a stateless, resumable **execution worker**. Study AI dispatches one execution ("hop") of a task to GitHub Actions; the worker runs model and tool-gateway iterations for up to ~6 hours, then reports `completed`, `paused_for_user`, `failed_terminal`, `cancelled`, or checkpoints and reports `handoff_pending` so Study AI can dispatch the next hop. Study AI remains the source of truth for task state, evidence, verification and completion.
+
+- Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Lifecycle, stop reasons, deadline settings: [docs/EXECUTION_LIFECYCLE.md](docs/EXECUTION_LIFECYCLE.md)
+- Exact Study AI integration contract (dispatch, callbacks, checkpoint store, tool gateway): [docs/CALLBACK_PROTOCOL.md](docs/CALLBACK_PROTOCOL.md)
+- Tests: `npm run test:worker` (or `node --test .github/scripts/tests/*.test.mjs`)
+
+New repository variables for the v2 protocol: `STUDYAI_CHECKPOINT_URL`, `CHECKPOINT_ALLOWED_HOSTS` (defaults to `CALLBACK_ALLOWED_HOSTS`), and the execution-safety settings listed in the lifecycle doc. The former 12-round / 60-call limits are gone; only `EMERGENCY_*` runaway guards remain and they trigger checkpoint + handoff.
+
+The sections below describe the original (still supported) legacy flow.
+
+---
+
 
 Longrun dispatches streamed AI work through a chat-completions-compatible API into a GitHub Actions job (up to six hours). It supports bounded multi-step tool calling through your app's broker, task-scoped temporary files, and optional isolated container commands for document conversion or approved software.
 
