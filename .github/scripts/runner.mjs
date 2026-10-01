@@ -1,7 +1,6 @@
-import { mkdtemp, mkdir, mkdtemp as makeTempDirectory, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
 
 const MAX_ATTEMPTS = 3;
 const MAX_PROMPT_LENGTH = 200_000;
@@ -14,8 +13,6 @@ const MAX_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_STORAGE_FILES = 10_000;
 const DEFAULT_STORAGE_BYTES = 512 * 1024 * 1024;
 const DEFAULT_STORAGE_FILES = 1_000;
-const ALLOWED_TOOL_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
-const FORBIDDEN_HEADERS = /^(authorization|proxy-authorization|cookie|set-cookie|host|content-length|connection|transfer-encoding|x-api-key)$/i;
 
 const fail = (message) => { throw new Error(message); };
 
@@ -66,11 +63,12 @@ function validateCallback(payload) {
 function validateBroker(payload) {
   if (!payload.tools?.length) return null;
   const broker = payload.tool_broker;
-  if (!broker || typeof broker.url !== "string" || typeof broker.app_user_id !== "string" || !/^[\w-]{1,200}$/.test(broker.app_user_id)) {
-    fail("Tool calling requires tool_broker.url and the authenticated app user's stable app_user_id.");
+  const brokerUrl = typeof broker?.url === "string" ? broker.url : process.env.TOOL_BROKER_URL?.trim();
+  if (!broker || typeof brokerUrl !== "string" || typeof broker.app_user_id !== "string" || !/^[\w-]{1,200}$/.test(broker.app_user_id)) {
+    fail("Tool calling requires a configured app tool-broker URL and the authenticated app user's stable app_user_id.");
   }
   let url;
-  try { url = new URL(broker.url); } catch { fail("tool_broker.url must be a valid HTTPS URL."); }
+  try { url = new URL(brokerUrl); } catch { fail("The app tool-broker URL must be a valid HTTPS URL."); }
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) fail("tool_broker.url must be HTTPS without credentials, query parameters, or fragments.");
   const allowedHosts = (process.env.TOOL_BROKER_ALLOWED_HOSTS || "").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
   if (!allowedHosts.length || !allowedHosts.includes(url.hostname.toLowerCase())) fail("Add the app broker hostname to the TOOL_BROKER_ALLOWED_HOSTS repository variable.");
@@ -186,7 +184,7 @@ function scratchLimits(payload) {
   return { maxBytes: rawBytes, maxFiles: rawFiles };
 }
 
-async function createScratchSpace(payload) {
+async function createScratchSpace(payload, limits) {
   const basePath = process.env.TASK_STORAGE_BASE?.trim() || tmpdir();
   const base = resolve(basePath);
   await mkdir(base, { recursive: true });
@@ -198,7 +196,7 @@ async function createScratchSpace(payload) {
     if (destination !== root && !destination.startsWith(`${root}${sep}`)) fail("storage.path must stay within the task's temporary workspace.");
     await mkdir(destination, { recursive: true });
   }
-  return { root, limits: scratchLimits(payload) };
+  return { root, limits };
 }
 
 function scratchPath(root, path) {
@@ -244,9 +242,10 @@ async function scratchTool(call, scratch) {
     return text;
   }
   if (call.function.name === "scratch_write") {
-    if (typeof input.content !== "string") fail("scratch_write requires text content.");
+    const content = typeof input.content === "string" ? input.content : typeof input.content_base64 === "string" ? Buffer.from(input.content_base64, "base64") : null;
+    if (content === null) fail("scratch_write requires text content or content_base64.");
     await mkdir(resolve(path, ".."), { recursive: true });
-    await writeFile(path, input.content, { flag: "w" });
+    await writeFile(path, content, { flag: "w" });
     const usage = await inspectScratch(scratch.root, scratch.limits);
     return JSON.stringify({ saved: true, path: resolve(scratch.root, path).slice(scratch.root.length + 1), ...usage });
   }
@@ -275,14 +274,25 @@ function scratchTools() {
   ];
 }
 
-async function callBroker(call, broker) {
+async function callBroker(call, broker, scratch) {
   let args;
   try { args = JSON.parse(call.function.arguments || "{}"); } catch { fail(`Tool ${call.function.name} returned invalid JSON arguments.`); }
+  const files = [];
+  if (args.files !== undefined && !Array.isArray(args.files)) fail("Tool file attachments must be supplied as a files array.");
+  for (const file of args.files || []) {
+    if (!file || typeof file.path !== "string") fail("Each tool attachment must include a scratch-file path.");
+    const path = scratchPath(scratch.root, file.path);
+    const info = await stat(path).catch(() => null);
+    if (!info?.isFile() || info.isSymbolicLink()) fail("A tool attachment must refer to a regular task scratch file.");
+    const bytes = await readFile(path);
+    if (bytes.byteLength > MAX_TOOL_RESULT_BYTES) fail("A single tool attachment exceeds the supported size limit.");
+    files.push({ path: file.path, name: typeof file.name === "string" ? file.name.slice(0, 180) : file.path.split(/[\\/]/).pop(), content_type: typeof file.content_type === "string" ? file.content_type.slice(0, 160) : "application/octet-stream", content_base64: bytes.toString("base64") });
+  }
   const response = await fetch(broker.url, {
     method: "POST",
     redirect: "error",
     headers: { Authorization: `Bearer ${broker.authToken}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args }),
+    body: JSON.stringify({ protocol: "longrun.tool-broker.v1", task_id: broker.taskId, app_user_id: broker.appUserId, tool_call_id: call.id, name: call.function.name, arguments: args, files }),
   });
   if (!response.ok) {
     const detail = safeMessage(await response.text(), broker.authToken, process.env.AI_API_KEY, process.env.CALLBACK_TOKEN);
@@ -290,6 +300,15 @@ async function callBroker(call, broker) {
   }
   const result = await response.json();
   if (result?.ok === false) fail(safeMessage(result.error?.message || "The app tool broker rejected the tool request.", broker.authToken));
+  for (const file of result?.files || []) {
+    if (!file || typeof file.path !== "string" || typeof file.content_base64 !== "string") fail("The app tool broker returned an invalid file attachment.");
+    const path = scratchPath(scratch.root, file.path);
+    const bytes = Buffer.from(file.content_base64, "base64");
+    if (bytes.byteLength > MAX_TOOL_RESULT_BYTES) fail("A single broker file attachment exceeds the supported size limit.");
+    await mkdir(resolve(path, ".."), { recursive: true });
+    await writeFile(path, bytes, { flag: "w" });
+  }
+  if (result?.files?.length) await inspectScratch(scratch.root, scratch.limits);
   const serialized = JSON.stringify(result?.result ?? result);
   if (Buffer.byteLength(serialized) > MAX_TOOL_RESULT_BYTES) fail("The app tool broker result exceeds the supported tool-result limit.");
   return serialized;
@@ -298,7 +317,7 @@ async function callBroker(call, broker) {
 async function runTool(call, broker, scratch) {
   if (call.function.name.startsWith("scratch_")) return scratchTool(call, scratch);
   if (!broker) fail(`Tool ${call.function.name} requires an authorized app tool broker.`);
-  return callBroker(call, broker);
+  return callBroker(call, broker, scratch);
 }
 
 async function requestAi(payload, apiKey, chatUrl, model, messages, tools) {
@@ -374,8 +393,9 @@ async function main() {
   const apiKey = process.env.AI_API_KEY?.trim();
   if (!apiKey) fail("Configure the AI_API_KEY repository secret.");
   const { chatUrl } = getEndpoints();
-  const scratch = await createScratchSpace(payload);
   const broker = validateBroker(payload);
+  const limits = scratchLimits(payload);
+  const scratch = await createScratchSpace(payload, limits);
   if (broker) broker.taskId = payload.task_id;
   console.log(`Starting task ${payload.task_id}; scratch limit ${scratch.limits.maxBytes} bytes / ${scratch.limits.maxFiles} files.`);
   try {
