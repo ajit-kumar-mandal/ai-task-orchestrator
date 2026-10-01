@@ -25,7 +25,10 @@ jobs:
           TOOL_BROKER_URL: ${{ vars.TOOL_BROKER_URL }}
           TOOL_BROKER_TOKEN: ${{ secrets.TOOL_BROKER_TOKEN }}
           TOOL_BROKER_ALLOWED_HOSTS: ${{ vars.TOOL_BROKER_ALLOWED_HOSTS }}
+          TASK_CONTAINER_IMAGES: ${{ vars.TASK_CONTAINER_IMAGES }}
           TASK_STORAGE_MAX_BYTES: ${{ vars.TASK_STORAGE_MAX_BYTES }}
           TASK_STORAGE_MAX_FILES: ${{ vars.TASK_STORAGE_MAX_FILES }}
           TASK_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
-        run: node .github/scripts/runner.mjs
+        run: |
+          node .github/scripts/prepare-images.mjs
+          node .github/scripts/runner.mjs
