@@ -4,3 +4,4 @@
 - [x] Keep per-task file storage temporary, configurable, and cleaned up after each run.
 - [x] Document broker security, tool-loop payload, scratch storage, and verify the complete flow.
 - [x] Encrypt app-issued tool grants and constrain optional commands to pinned isolated containers.
+- [x] Production execution worker: lifecycle states, execution identity, checkpoint/handoff, idempotent callbacks, generic tool gateway, failure taxonomy, tests, docs.
