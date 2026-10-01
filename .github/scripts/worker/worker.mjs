@@ -197,6 +197,8 @@ export async function runExecution(options = {}) {
       });
       const action = handleDirective(directive);
       if (action?.status) return action;
+      // Nothing has run yet, so there is no new state to checkpoint: hand off at once.
+      if (action?.checkpointReason) return { status: ExecutionState.HANDOFF_PENDING, stopReason: action.checkpointReason, nextHopAt: iso(now()) };
     }
 
     const checkpoint = await loadCheckpoint({ payload, ...storeArgs });
